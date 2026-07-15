@@ -8,6 +8,7 @@ using Content.Server.AU14.Objectives.Interact;
 using Content.Server.AU14.Objectives.Kill;
 using Content.Server.AU14.Round;
 using Content.Server.GameTicking;
+using Content.Server.Maps;
 using Content.Shared._RMC14.Intel;
 using Content.Shared._RMC14.Rules;
 using Content.Shared._RMC14.Vendors;
@@ -78,22 +79,30 @@ public sealed partial class AuObjectiveSystem : AuSharedObjectiveSystem
     private void OnPostGameMapLoad(PostGameMapLoad ev)
     {
         IsWinActive = false;
+        var gameMap = ev.GameMap;
+        var map = ev.Map;
+        var grids = ev.Grids.ToArray();
+        Timer.Spawn(0, () => SetupPostGameMapLoad(gameMap, map, grids));
+    }
+
+    private void SetupPostGameMapLoad(GameMapPrototype gameMap, MapId mapId, IReadOnlyList<EntityUid> grids)
+    {
         var presetId = _gameTicker.Preset?.ID;
         if (string.IsNullOrWhiteSpace(presetId))
             return;
 
         var selectedPlanet = _auRoundSystem.GetSelectedPlanet();
         if (selectedPlanet == null
-            || !ev.GameMap.ID.Equals(selectedPlanet.MapId, StringComparison.OrdinalIgnoreCase))
+            || !gameMap.ID.Equals(selectedPlanet.MapId, StringComparison.OrdinalIgnoreCase))
         {
-            _logs.Debug($"[OBJ MASTER] OnPostGameMapLoad: map '{ev.GameMap.ID}' is not the voted planet '{selectedPlanet?.MapId}', skipping.");
+            _logs.Debug($"[OBJ MASTER] OnPostGameMapLoad: map '{gameMap.ID}' is not the voted planet '{selectedPlanet?.MapId}', skipping.");
             return;
         }
 
         // first grid index could be a dropship/faulty mapped grid (need to grab largest)
         EntityUid? bestPlanetGrid = null;
         float bestArea = -1f;
-        foreach (var grid in ev.Grids)
+        foreach (var grid in grids)
         {
             if (!TryComp<MapGridComponent>(grid, out var gridComp)) continue;
             var area = gridComp.LocalAABB.Width * gridComp.LocalAABB.Height;
@@ -111,13 +120,13 @@ public sealed partial class AuObjectiveSystem : AuSharedObjectiveSystem
         }
         _logs.Debug($"[OBJ MASTER] OnPostGameMapLoad: planet map '{selectedPlanet.MapId}' loaded as main map, with valid grid ({bestPlanetGrid.Value})");
 
-        _planetMapId = ev.Map;
-        EnsureComp<RMCPlanetComponent>(_mapSystem.GetMap(ev.Map));
+        _planetMapId = mapId;
+        EnsureComp<RMCPlanetComponent>(_mapSystem.GetMap(mapId));
         var hasPlanetMaster = false;
         var masterScan = EntityQueryEnumerator<ObjectiveMasterComponent, TransformComponent>();
         while (masterScan.MoveNext(out var mUid, out _, out var mXform))
         {
-            if (mXform.MapID != ev.Map)
+            if (mXform.MapID != mapId)
                 continue;
 
             hasPlanetMaster = true;
@@ -142,7 +151,7 @@ public sealed partial class AuObjectiveSystem : AuSharedObjectiveSystem
 
             _objectiveMasterUid = Spawn(proto.ID, new EntityCoordinates(bestPlanetGrid.Value, Vector2.Zero));
             spawnedIn = true;
-            _logs.Warning($"[OBJ MASTER] OnPostGameMapLoad: auto-spawned MISSING ObjectiveMaster '{proto.ID}' for preset '{presetId}' on planet '{ev.GameMap.MapName}'");
+            _logs.Warning($"[OBJ MASTER] OnPostGameMapLoad: auto-spawned MISSING ObjectiveMaster '{proto.ID}' for preset '{presetId}' on planet '{gameMap.MapName}'");
             break;
         }
 
@@ -154,7 +163,7 @@ public sealed partial class AuObjectiveSystem : AuSharedObjectiveSystem
         }
 
         if (TryComp<ObjectiveMasterComponent>(_objectiveMasterUid, out var master))
-            _fetchObjectiveSystem.SpawnMissingFetchObjectives(presetId, ev.Map, master, _allObjectives, _proto);
+            _fetchObjectiveSystem.SpawnMissingFetchObjectives(presetId, mapId, master, _allObjectives, _proto);
         Timer.Spawn(0, Main);
     }
 
@@ -226,7 +235,7 @@ public sealed partial class AuObjectiveSystem : AuSharedObjectiveSystem
         {
             // Only end the round automatically for final objectives if their FinalType is InstantWin.
             if (objective.FinalType == AuObjectiveComponent.FinalObjectiveType.InstantWin)
-                EndRound(completingFaction, objective.RoundEndMessage);
+                DeclareObjectiveVictory(completingFaction, objective.RoundEndMessage);
             else
                 _logs.Info($"[OBJ FINAL] Final objective '{objective.objectiveDescription}' completed for faction '{completingFaction}' as Boon; not ending the round.");
         }
@@ -266,7 +275,10 @@ public sealed partial class AuObjectiveSystem : AuSharedObjectiveSystem
             _objectivesConsoleSystem.RefreshConsolesForFaction(objective.Faction);
     }
 
-    private void EndRound(string faction, string? roundEndMessage)
+    /// <summary>
+    /// Ends the round with an objective victory for the supplied faction and records the result.
+    /// </summary>
+    public void DeclareObjectiveVictory(string faction, string? roundEndMessage)
     {
         var message = roundEndMessage ?? string.Empty;
         var roundEndText = Loc.GetString("objectives-system-round-end",
